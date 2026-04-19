@@ -57,7 +57,10 @@ def days_to_expiry_series(ric_df: pd.DataFrame):
     ltd = ltd.iloc[0]
     out = ric_df[["Date", "open_interest"]].copy()
     out["days_exp"] = (ltd - out["Date"]).dt.days
-    return out[out["days_exp"] >= 0].set_index("days_exp")["open_interest"]
+    out = out[out["days_exp"] >= 0]
+    # deduplicate: one value per days_exp (take last, i.e. latest Date for that day count)
+    out = out.sort_values("Date").drop_duplicates("days_exp", keep="last")
+    return out.set_index("days_exp")["open_interest"]
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -164,7 +167,7 @@ fig.add_trace(go.Scatter(
 fig.add_trace(go.Scatter(
     x=days_axis, y=stats["median"],
     mode="lines", name="Median",
-    line=dict(color="rgba(255,255,255,0.85)", width=2, dash="dot"),
+    line=dict(color="rgba(80,80,80,0.9)", width=2, dash="dot"),
 ))
 
 # Current contract
@@ -186,19 +189,21 @@ fig.update_layout(
         title="Days Until Expiry",
         autorange="reversed",
         nticks=25,
-        showgrid=True, gridcolor="rgba(255,255,255,0.08)",
+        showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+        linecolor="#aaaaaa",
     ),
     yaxis=dict(
         title="Open Interest",
-        showgrid=True, gridcolor="rgba(255,255,255,0.08)",
+        showgrid=True, gridcolor="rgba(0,0,0,0.08)",
+        linecolor="#aaaaaa",
         tickformat=",",
     ),
     legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
     hovermode="x unified",
     height=580,
-    plot_bgcolor="rgba(30,34,45,1)",
-    paper_bgcolor="rgba(30,34,45,1)",
-    font=dict(color="white"),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font=dict(color="#222222"),
 )
 
 st.plotly_chart(fig, use_container_width=True)
