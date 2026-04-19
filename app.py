@@ -44,23 +44,36 @@ def load(commodity: str) -> pd.DataFrame:
 
 
 def contract_label(ric: str) -> str:
-    if len(ric) >= 2:
-        mc, yr = ric[-2], ric[-1]
-        return f"{MONTH_CODES.get(mc, mc)}-2{yr}0"
+    if len(ric) >= 4:
+        mc = ric[-2]
+        yr = ric[-1]
+        return f"{MONTH_CODES.get(mc, mc)}-{yr}"
     return ric
 
 
-def days_to_expiry_series(ric_df: pd.DataFrame):
+def smooth_series(ric_df: pd.DataFrame) -> pd.Series | None:
+    """
+    Return a Series indexed by integer days-until-LTD (descending),
+    on a complete integer grid with no gaps (forward-fill across non-trading days).
+    """
     ltd = ric_df["LTD"].dropna()
     if ltd.empty:
         return None
     ltd = ltd.iloc[0]
+
     out = ric_df[["Date", "open_interest"]].copy()
     out["days_exp"] = (ltd - out["Date"]).dt.days
     out = out[out["days_exp"] >= 0]
-    # deduplicate: one value per days_exp (take last, i.e. latest Date for that day count)
+    # one value per calendar day — take the last trading day's OI for that count
     out = out.sort_values("Date").drop_duplicates("days_exp", keep="last")
-    return out.set_index("days_exp")["open_interest"]
+    s = out.set_index("days_exp")["open_interest"].astype(float)
+
+    # reindex to full integer range and forward-fill gaps (weekends / holidays)
+    full_range = np.arange(s.index.max(), -1, -1)   # high → 0
+    s = s.reindex(full_range)
+    # forward-fill going from high days down to 0 (i.e., fill from earlier date forward)
+    s = s.sort_index(ascending=False).ffill().bfill()
+    return s
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -96,8 +109,8 @@ with col_sel:
 if not sel_contract or len(sel_contract) < 4:
     st.stop()
 
-base = sel_contract[:-2]
-month_code = sel_contract[-2]
+base       = sel_contract[:-2]   # e.g. "KC"
+month_code = sel_contract[-2]    # e.g. "U"
 
 hist_rics = df[
     df["base_ric"].str.startswith(base) &
@@ -105,10 +118,10 @@ hist_rics = df[
     ~df["base_ric"].eq(sel_contract)
 ]["base_ric"].unique()
 
-hist_matrix = {}
+hist_matrix: dict[str, pd.Series] = {}
 for ric in hist_rics:
-    s = days_to_expiry_series(df[df["base_ric"] == ric])
-    if s is not None and len(s) > 10:
+    s = smooth_series(df[df["base_ric"] == ric])
+    if s is not None and len(s) > 20:
         hist_matrix[ric] = s
 
 with col_info:
@@ -122,57 +135,65 @@ if not hist_matrix:
     st.warning("Not enough historical contracts with the same month code to build bands.")
     st.stop()
 
-hist_df = pd.DataFrame(hist_matrix).sort_index(ascending=False)
+# Align all series on a common integer index, compute stats
+hist_df = pd.DataFrame(hist_matrix)   # index = days_exp (may have NaN where contracts differ)
+hist_df = hist_df.sort_index(ascending=False)
 
+# Stats — skip NaN so short-lived contracts don't drag down counts at high day counts
 stats = pd.DataFrame({
     "min":    hist_df.min(axis=1),
     "q1":     hist_df.quantile(0.25, axis=1),
     "median": hist_df.median(axis=1),
     "q3":     hist_df.quantile(0.75, axis=1),
     "max":    hist_df.max(axis=1),
-})
+}).dropna()
 
-cur_s = days_to_expiry_series(df[df["base_ric"] == sel_contract])
-days_axis = stats.index
+cur_s = smooth_series(df[df["base_ric"] == sel_contract])
+if cur_s is not None:
+    cur_s = cur_s.sort_index(ascending=False)
 
+days_axis = stats.index  # descending (700 → 0)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
 fig = go.Figure()
 
-# Outer band: Min to Max
+# Max line (top of outer band)
 fig.add_trace(go.Scatter(
     x=days_axis, y=stats["max"],
     mode="lines", name="Max",
-    line=dict(color="rgba(144,238,144,0.7)", width=1.5),
+    line=dict(color="rgba(100,200,100,0.8)", width=1.2),
 ))
+# Min line — fills back up to Max creating the outer envelope
 fig.add_trace(go.Scatter(
     x=days_axis, y=stats["min"],
     mode="lines", name="Min",
-    fill="tonexty", fillcolor="rgba(144,238,144,0.10)",
-    line=dict(color="rgba(210,180,140,0.7)", width=1.5),
+    fill="tonexty", fillcolor="rgba(100,200,100,0.10)",
+    line=dict(color="rgba(200,160,100,0.8)", width=1.2),
 ))
 
-# IQR band: Q1 to Q3
+# Upper quartile
 fig.add_trace(go.Scatter(
     x=days_axis, y=stats["q3"],
     mode="lines", name="Upper Quartile",
-    line=dict(color="rgba(180,180,180,0.9)", width=1.5),
+    line=dict(color="rgba(150,150,150,0.9)", width=1.2),
 ))
+# Lower quartile — fills back up to Q3
 fig.add_trace(go.Scatter(
     x=days_axis, y=stats["q1"],
     mode="lines", name="Lower Quartile",
-    fill="tonexty", fillcolor="rgba(180,180,180,0.22)",
-    line=dict(color="rgba(180,180,180,0.9)", width=1.5),
+    fill="tonexty", fillcolor="rgba(150,150,150,0.20)",
+    line=dict(color="rgba(150,150,150,0.9)", width=1.2),
 ))
 
 # Median
 fig.add_trace(go.Scatter(
     x=days_axis, y=stats["median"],
     mode="lines", name="Median",
-    line=dict(color="rgba(80,80,80,0.9)", width=2, dash="dot"),
+    line=dict(color="#444444", width=2, dash="dot"),
 ))
 
-# Current contract
+# Current contract — black on top
 if cur_s is not None:
-    cur_s = cur_s.sort_index(ascending=False)
     fig.add_trace(go.Scatter(
         x=cur_s.index, y=cur_s.values,
         mode="lines", name=sel_contract,
@@ -183,27 +204,29 @@ fig.update_layout(
     title=dict(
         text=f"OI Progression of : {sel_contract}",
         x=0.5, xanchor="center",
-        font=dict(size=18),
+        font=dict(size=17, color="#222222"),
     ),
     xaxis=dict(
         title="Days Until Expiry",
         autorange="reversed",
         nticks=25,
-        showgrid=True, gridcolor="rgba(0,0,0,0.08)",
-        linecolor="#aaaaaa",
+        showgrid=True, gridcolor="rgba(0,0,0,0.07)",
+        linecolor="#cccccc", tickcolor="#888888",
     ),
     yaxis=dict(
         title="Open Interest",
-        showgrid=True, gridcolor="rgba(0,0,0,0.08)",
-        linecolor="#aaaaaa",
+        showgrid=True, gridcolor="rgba(0,0,0,0.07)",
+        linecolor="#cccccc", tickcolor="#888888",
         tickformat=",",
     ),
-    legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+    legend=dict(orientation="h", y=-0.14, x=0.5, xanchor="center",
+                font=dict(color="#333333")),
     hovermode="x unified",
     height=580,
     plot_bgcolor="white",
     paper_bgcolor="white",
-    font=dict(color="#222222"),
+    font=dict(color="#333333"),
+    margin=dict(t=60, b=80),
 )
 
 st.plotly_chart(fig, use_container_width=True)
