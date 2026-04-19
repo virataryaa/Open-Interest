@@ -51,28 +51,24 @@ def contract_label(ric: str) -> str:
     return ric
 
 
-def smooth_series(ric_df: pd.DataFrame) -> pd.Series | None:
+def smooth_series(ric_df: pd.DataFrame, ltd: pd.Timestamp) -> pd.Series | None:
     """
-    Return a Series indexed by integer days-until-LTD (descending),
-    on a complete integer grid with no gaps (forward-fill across non-trading days).
+    Return a Series indexed by integer days-until-LTD, filled across weekends/holidays,
+    but only within the range of actual observations (never extrapolated forward).
     """
-    ltd = ric_df["LTD"].dropna()
-    if ltd.empty:
-        return None
-    ltd = ltd.iloc[0]
-
     out = ric_df[["Date", "open_interest"]].copy()
     out["days_exp"] = (ltd - out["Date"]).dt.days
     out = out[out["days_exp"] >= 0]
-    # one value per calendar day — take the last trading day's OI for that count
+    if out.empty:
+        return None
     out = out.sort_values("Date").drop_duplicates("days_exp", keep="last")
     s = out.set_index("days_exp")["open_interest"].astype(float)
 
-    # reindex to full integer range and forward-fill gaps (weekends / holidays)
-    full_range = np.arange(s.index.max(), -1, -1)   # high → 0
-    s = s.reindex(full_range)
-    # forward-fill going from high days down to 0 (i.e., fill from earlier date forward)
-    s = s.sort_index(ascending=False).ffill().bfill()
+    # Fill only within the actual data window — never beyond the last real observation
+    min_days = int(s.index.min())
+    max_days = int(s.index.max())
+    full_range = np.arange(max_days, min_days - 1, -1)
+    s = s.reindex(full_range).sort_index(ascending=False).ffill().bfill()
     return s
 
 
@@ -112,23 +108,34 @@ if not sel_contract or len(sel_contract) < 4:
 base       = sel_contract[:-2]   # e.g. "KC"
 month_code = sel_contract[-2]    # e.g. "U"
 
-hist_rics = df[
-    df["base_ric"].str.startswith(base) &
-    df["base_ric"].str[-2].eq(month_code) &
-    ~df["base_ric"].eq(sel_contract)
-]["base_ric"].unique()
+# Get the exact LTD for the selected contract from the latest date row
+sel_ltd_row = df[(df["base_ric"] == sel_contract) & (df["Date"] == latest_date)]
+if sel_ltd_row.empty:
+    st.error("Cannot find LTD for selected contract.")
+    st.stop()
+sel_ltd = sel_ltd_row["LTD"].iloc[0]
+
+# Find historical contracts: same commodity prefix + same month code, different LTD
+# Group by (base_ric, LTD) to correctly handle decade ambiguity (e.g. KCZ6 = 2016 and 2026)
+contract_ltds = (
+    df[df["base_ric"].str.startswith(base) & df["base_ric"].str[-2].eq(month_code)]
+    .groupby("base_ric")["LTD"].first()
+)
+hist_contracts = contract_ltds[contract_ltds != sel_ltd]  # exclude current contract's LTD
 
 hist_matrix: dict[str, pd.Series] = {}
-for ric in hist_rics:
-    s = smooth_series(df[df["base_ric"] == ric])
+for ric, ltd in hist_contracts.items():
+    ric_data = df[(df["base_ric"] == ric) & (df["LTD"] == ltd)]
+    s = smooth_series(ric_data, ltd)
     if s is not None and len(s) > 20:
-        hist_matrix[ric] = s
+        label_key = f"{ric}({ltd.year})"
+        hist_matrix[label_key] = s
 
 with col_info:
     st.caption(
         f"Latest data: **{latest_date.strftime('%d %b %Y')}** | "
-        f"Historical contracts used: **{len(hist_matrix)}** "
-        f"({', '.join(sorted(hist_matrix.keys()))})"
+        f"LTD: **{sel_ltd.strftime('%d %b %Y')}** | "
+        f"Historical contracts: **{len(hist_matrix)}**"
     )
 
 if not hist_matrix:
@@ -148,7 +155,10 @@ stats = pd.DataFrame({
     "max":    hist_df.max(axis=1),
 }).dropna()
 
-cur_s = smooth_series(df[df["base_ric"] == sel_contract])
+cur_s = smooth_series(
+    df[(df["base_ric"] == sel_contract) & (df["LTD"] == sel_ltd)],
+    sel_ltd
+)
 if cur_s is not None:
     cur_s = cur_s.sort_index(ascending=False)
 
